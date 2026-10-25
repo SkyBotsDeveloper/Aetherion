@@ -1,0 +1,281 @@
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import traceback
+import inspect
+from typing import Tuple
+
+from pyrogram import raw, filters
+from pyrogram.errors import (
+    StickersetInvalid,
+    StickersTooMuch,
+    StickerEmojiInvalid,
+    PeerIdInvalid,
+    FloodWait,
+    FileReferenceExpired,
+    RPCError,
+)
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from AETH import app
+from AETH.utils.files import resize_file_to_sticker_size
+from AETH.utils.sticker_packs import (
+    StickerOwnerUnavailable,
+    create_sticker_set_for_user,
+    get_sticker_bot_username,
+    prompt_sticker_owner_start,
+)
+from AETH.security import build_subprocess_env
+from AETH.utils.rich_buttons import rich_call
+
+
+def _video_metadata(path: str) -> Tuple[float, int, int]:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:format=duration",
+            "-of", "json", path,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=build_subprocess_env(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or "could not inspect converted video")
+
+    data = json.loads(result.stdout)
+    stream = data["streams"][0]
+    duration = float(data["format"]["duration"])
+    width, height = int(stream["width"]), int(stream["height"])
+    if not 0 < duration <= 3.1 or max(width, height) > 512:
+        raise ValueError("video sticker must be 1–3 seconds and no larger than 512px")
+    return duration, width, height
+
+
+def _cs_kwargs(is_anim: bool, is_vid: bool) -> dict:
+    """
+    Return only the `animated`/`videos` flags supported by this Pyrogram build.
+    """
+    params = inspect.signature(raw.functions.stickers.CreateStickerSet).parameters
+    kw = {}
+    if is_anim and "animated" in params:
+        kw["animated"] = True
+    if is_vid and "videos" in params:
+        kw["videos"] = True
+    return kw
+
+
+def _pack_name(user_id: int, bot_username: str, *, animated=False, video=False, index=0) -> str:
+    """
+    Build a valid short_name:
+      user<id>_<type>[ _pack<index> ]_by_<bot>
+    """
+    parts = [f"user{user_id}"]
+    parts.append("animated" if animated else "video" if video else "regular")
+    if index:
+        parts.append(f"pack{index}")
+    parts += ["by", bot_username]
+    return "_".join(parts)
+
+
+def _pack_title(username: str, *, animated=False, video=False, index=0) -> str:
+    """
+    Human‑readable pack title:
+      <User>'s Sticker/Animated/Video Pack [<index>]
+    """
+    kind = "Animated" if animated else "Video" if video else "Sticker"
+    suffix = f" {index}" if index else ""
+    return f"{username}'s {kind} Pack{suffix}"
+
+
+def _to_input_doc(doc: raw.base.Document) -> raw.types.InputDocument:
+    """
+    Convert a raw Document into an InputDocument for sticker‑set calls.
+    """
+    return raw.types.InputDocument(
+        id=doc.id,
+        access_hash=doc.access_hash,
+        file_reference=doc.file_reference
+    )
+
+
+async def _prepare_media(message, tmp_dir: str, notify) -> Tuple[str, str, bool, bool]:
+    r = message.reply_to_message
+
+    if r.sticker:
+        await rich_call(notify.edit, "➣ ᴘʀᴏᴄᴇssɪɴɢ sᴛɪᴄᴋᴇʀ…")
+        s = r.sticker
+        if s.is_animated:
+            return "sticker", await r.download(os.path.join(tmp_dir, "sticker.tgs")), True, False
+        if s.is_video:
+            return "sticker", await r.download(os.path.join(tmp_dir, "sticker.webm")), False, True
+        path = await r.download(os.path.join(tmp_dir, "sticker"))
+        return "sticker", await resize_file_to_sticker_size(path), False, False
+
+    document_mime = (r.document.mime_type or "").lower() if r.document else ""
+    document_name = (r.document.file_name or "").lower() if r.document else ""
+    if (
+        r.video or r.video_note or r.animation or
+        document_mime.startswith("video/") or
+        document_mime == "image/gif" or
+        document_name.endswith((".mp4", ".m4v", ".mov", ".mkv", ".webm", ".gif"))
+    ):
+        await rich_call(notify.edit, "➣ ᴘʀᴏᴄᴇssɪɴɢ ɢɪꜰ/ᴠɪᴅᴇᴏ…")
+        raw_v = await r.download(os.path.join(tmp_dir, "raw.mp4"))
+        out_v = os.path.join(tmp_dir, "sticker.webm")
+        cmd = [
+            "ffmpeg", "-y", "-i", raw_v,
+            "-vf", "scale=512:512:flags=lanczos:force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "-ss", "0", "-t", "3",
+            "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-b:v", "500k", "-crf", "30",
+            "-an", "-r", "30",
+            out_v
+        ]
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=build_subprocess_env(),
+        )
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode())
+        return "video", out_v, False, True
+
+    if r.photo or (
+        r.document and (
+            document_mime.startswith("image/") or
+            document_name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+        )
+    ):
+        await rich_call(notify.edit, "➣ ᴄᴏɴᴠᴇʀᴛɪɴɢ ɪᴍᴀɢᴇ…")
+        p = await r.download(os.path.join(tmp_dir, "image"))
+        p = await resize_file_to_sticker_size(p)
+        return "image", p, False, False
+
+    raise ValueError("unsupported media type")
+
+
+@app.on_message(filters.command("kang") & filters.reply)
+async def kang(client, message):
+    notify = await message.reply_text("➣ ᴘʀᴏᴄᴇssɪɴɢ…")
+    tmp_dir = tempfile.mkdtemp()
+
+    try:
+        kind, path, is_anim, is_vid = await _prepare_media(message, tmp_dir, notify)
+        uid = message.from_user.id
+        uname = message.from_user.first_name
+        bot_username = await get_sticker_bot_username(client)
+        video_metadata = _video_metadata(path) if is_vid else None
+        limit = 50 if is_anim or is_vid else 120
+
+        idx = 0
+        while True:
+            short = _pack_name(uid, bot_username, animated=is_anim, video=is_vid, index=idx)
+            try:
+                sset = await client.invoke(
+                    raw.functions.messages.GetStickerSet(
+                        stickerset=raw.types.InputStickerSetShortName(short_name=short),
+                        hash=0
+                    )
+                )
+                if len(sset.documents) >= limit:
+                    idx += 1
+                    continue
+                break
+            except StickersetInvalid:
+                break
+
+        title = _pack_title(uname, animated=is_anim, video=is_vid, index=idx)
+
+        upload = await client.invoke(
+            raw.functions.messages.UploadMedia(
+                peer=await client.resolve_peer(message.chat.id),
+                media=raw.types.InputMediaUploadedDocument(
+                    file=await client.save_file(path),
+                    mime_type=(
+                        "application/x-tgsticker" if is_anim else
+                        "video/webm"         if is_vid  else
+                        "image/png"
+                    ),
+                    attributes=[
+                        raw.types.DocumentAttributeFilename(file_name=os.path.basename(path)),
+                        raw.types.DocumentAttributeSticker(alt="", stickerset=raw.types.InputStickerSetEmpty(), mask=False)
+                    ] + (
+                        [raw.types.DocumentAttributeVideo(
+                            duration=video_metadata[0],
+                            w=video_metadata[1],
+                            h=video_metadata[2],
+                            round_message=False,
+                            supports_streaming=False,
+                        )]
+                        if is_vid else []
+                    )
+                )
+            )
+        )
+        doc = upload.document
+
+        emoji = message.command[1] if len(message.command) > 1 else "🤔"
+
+        try:
+            await client.invoke(
+                raw.functions.stickers.AddStickerToSet(
+                    stickerset=raw.types.InputStickerSetShortName(short_name=short),
+                    sticker=raw.types.InputStickerSetItem(document=_to_input_doc(doc), emoji=emoji)
+                )
+            )
+            created = False
+        except StickersetInvalid:
+            await create_sticker_set_for_user(
+                client, message,
+                title=title,
+                short_name=short,
+                stickers=[raw.types.InputStickerSetItem(document=_to_input_doc(doc), emoji=emoji)],
+                **_cs_kwargs(is_anim, is_vid),
+            )
+            created = True
+        except StickersTooMuch:
+            idx += 1
+            short = _pack_name(uid, bot_username, animated=is_anim, video=is_vid, index=idx)
+            title = _pack_title(uname, animated=is_anim, video=is_vid, index=idx)
+            await create_sticker_set_for_user(
+                client, message,
+                title=title,
+                short_name=short,
+                stickers=[raw.types.InputStickerSetItem(document=_to_input_doc(doc), emoji=emoji)],
+                **_cs_kwargs(is_anim, is_vid),
+            )
+            created = True
+
+        sset = await client.invoke(
+            raw.functions.messages.GetStickerSet(
+                stickerset=raw.types.InputStickerSetShortName(short_name=short),
+                hash=0
+            )
+        )
+        count = len(sset.documents)
+        kind_lbl = "ᴀɴɪᴍᴀᴛᴇᴅ" if is_anim else "ᴠɪᴅᴇᴏ" if is_vid else "sᴛᴀᴛɪᴄ"
+
+        await rich_call(notify.edit,
+            f"➣ {'ᴄʀᴇᴀᴛᴇᴅ' if created else 'ᴀᴅᴅᴇᴅ ᴛᴏ'} ʏᴏᴜʀ {kind_lbl} ᴘᴀᴄᴋ!\n"
+            f"ᴘᴀᴄᴋ: {title}\n"
+            f"ᴄᴏᴜɴᴛ: {count}\n"
+            f"ᴇᴍᴏᴊɪ: {emoji}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("ᴏᴘᴇɴ ᴘᴀᴄᴋ", url=f"https://t.me/addstickers/{short}")]]
+            )
+        )
+
+    except StickerOwnerUnavailable:
+        await prompt_sticker_owner_start(notify, bot_username)
+    except FloodWait as e:
+        await rich_call(notify.edit, f"flood wait – retry in {e.x}s")
+    except (StickerEmojiInvalid, PeerIdInvalid, FileReferenceExpired, RPCError) as err:
+        await rich_call(notify.edit, f"error: {err}")
+    except Exception:
+        await rich_call(notify.edit, "unexpected error:\n" + traceback.format_exc())
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

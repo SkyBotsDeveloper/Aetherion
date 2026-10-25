@@ -1,0 +1,163 @@
+import random
+import re
+from typing import Union
+
+from pyrogram import Client, filters, types
+from pyrogram.types import InlineKeyboardMarkup, Message
+
+from AETH import app
+from AETH.utils.database import get_lang
+from AETH.utils.decorators.language import LanguageStart, languageCB
+from AETH.utils.inline.help import (
+    action_sub_menu,
+    first_page,
+    help_back_markup,
+    private_help_panel,
+    second_page,
+)
+from AETH.utils.inline.start import private_panel
+from config import BANNED_USERS, HELP_IMG_URL, START_VIDS, SUPPORT_CHAT
+from strings import get_string, helpers
+from AETH.utils.rich_buttons import rich_call, restore_welcome
+
+
+@app.on_message(filters.command(["help"]) & filters.private & ~BANNED_USERS)
+@app.on_callback_query(filters.regex("open_help") & ~BANNED_USERS)
+@LanguageStart
+async def helper_private(
+    client: Client,
+    update: Union[Message, types.CallbackQuery],
+    _,
+):
+    is_cb = isinstance(update, types.CallbackQuery)
+    language = await get_lang(update.from_user.id)
+    _ = get_string(language)
+
+    keyboard = first_page(_)
+    caption = _["help_1"].format(SUPPORT_CHAT)
+
+    if is_cb:
+        await update.answer()
+        await rich_call(update.message.edit_caption, caption, reply_markup=keyboard)
+        return
+
+    await update.delete()
+    await rich_call(update.reply_photo,
+        photo=HELP_IMG_URL,
+        caption=caption,
+        reply_markup=keyboard,
+    )
+
+
+@app.on_message(filters.command(["help"]) & filters.group & ~BANNED_USERS)
+@LanguageStart
+async def help_com_group(client: Client, message: Message, _):
+    keyboard = private_help_panel(_)
+    await rich_call(message.reply_text,
+        _["help_2"],
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
+    )
+
+
+@app.on_callback_query(filters.regex(r"help_callback hb(\d+)_p(\d+)") & ~BANNED_USERS)
+@languageCB
+async def helper_cb(client: Client, callback_query: types.CallbackQuery, _):
+    match = re.match(r"help_callback hb(\d+)_p(\d+)", callback_query.data)
+    if not match:
+        return await callback_query.answer("Invalid callback.", show_alert=True)
+
+    number = int(match.group(1))
+    current_page = int(match.group(2))
+
+    if number == 1:
+        await rich_call(callback_query.edit_message_text,
+            _["S_B_M"],
+            reply_markup=action_sub_menu(_, current_page),
+            disable_web_page_preview=True,
+        )
+        return
+
+    help_text = getattr(helpers, f"HELP_{number}", None)
+    if not help_text:
+        return await callback_query.answer("Invalid help topic.", show_alert=True)
+
+    await rich_call(callback_query.edit_message_text,
+        help_text,
+        reply_markup=help_back_markup(_, current_page),
+        disable_web_page_preview=True,
+    )
+
+
+@app.on_callback_query(filters.regex(r"help_next_(\d+)") & ~BANNED_USERS)
+@languageCB
+async def help_next_cb(client: Client, callback_query: types.CallbackQuery, _):
+    if callback_query.data != "help_next_2":
+        return await callback_query.answer("No more pages.", show_alert=True)
+
+    await rich_call(callback_query.edit_message_text,
+        _["help_1"].format(SUPPORT_CHAT),
+        reply_markup=second_page(_),
+        disable_web_page_preview=True,
+    )
+
+
+@app.on_callback_query(filters.regex(r"help_prev_(\d+)") & ~BANNED_USERS)
+@languageCB
+async def help_prev_cb(client: Client, callback_query: types.CallbackQuery, _):
+    if callback_query.data != "help_prev_1":
+        return await callback_query.answer("No previous page.", show_alert=True)
+
+    await rich_call(callback_query.edit_message_text,
+        _["help_1"].format(SUPPORT_CHAT),
+        reply_markup=first_page(_),
+        disable_web_page_preview=True,
+    )
+
+
+@app.on_callback_query(filters.regex(r"help_back_(\d+)") & ~BANNED_USERS)
+@languageCB
+async def help_back_cb(client: Client, callback_query: types.CallbackQuery, _):
+    page = callback_query.data.split("_")[-1]
+    if page == "1":
+        keyboard = first_page(_)
+    elif page == "2":
+        keyboard = second_page(_)
+    else:
+        return await callback_query.answer("Invalid page.", show_alert=True)
+
+    await rich_call(callback_query.edit_message_text,
+        _["help_1"].format(SUPPORT_CHAT),
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+@app.on_callback_query(filters.regex("action_prom_1") & ~BANNED_USERS)
+@languageCB
+async def action_prom_cb(client: Client, callback_query: types.CallbackQuery, _):
+    await rich_call(callback_query.edit_message_text,
+        helpers.HELP_1_PROMO,
+        reply_markup=help_back_markup(_, 1),
+        disable_web_page_preview=True,
+    )
+
+
+@app.on_callback_query(filters.regex("action_pun_1") & ~BANNED_USERS)
+@languageCB
+async def action_pun_cb(client: Client, callback_query: types.CallbackQuery, _):
+    await rich_call(callback_query.edit_message_text,
+        helpers.HELP_1_PUNISH,
+        reply_markup=help_back_markup(_, 1),
+        disable_web_page_preview=True,
+    )
+
+
+@app.on_callback_query(filters.regex("back_to_main") & ~BANNED_USERS)
+@languageCB
+async def back_to_main_cb(client: Client, callback_query: types.CallbackQuery, _):
+    out = private_panel(_)
+    await restore_welcome(callback_query.message,
+        _["start_2"].format(callback_query.from_user.mention, app.mention),
+        out, random.choice(START_VIDS),
+    )
